@@ -26,6 +26,12 @@ tab inside Blender.
    (Blender 4.2+) or `dist/ai_3d_bridge.py` (any version).
 4. In the 3D Viewport press **N** > **AI 3D** tab.
 
+## Tips
+
+- Feed **one figure per image** on a plain background, never a whole
+  character sheet. For sheets, cut out each view and use the **Views** tab
+  (`start_hunyuan.sh --multiview`). `examples/elian/` has cut-out views.
+
 ## Known fixes already applied
 
 - `diffusers` is pinned to 0.32.2. Newer versions break Hunyuan3D-2GP's

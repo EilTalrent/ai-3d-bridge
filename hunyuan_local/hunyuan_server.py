@@ -13,8 +13,9 @@ The trademark rights of "Tencent Hunyuan" are owned by Tencent or its affiliate.
 API (all JSON unless noted):
   GET  /health                -> server info
   POST /jobs                  -> {"id": ...}
-       mode: "image" | "text" | "texture"
+       mode: "image" | "text" | "texture" | "multiview"
        image: base64 PNG/JPG (image mode, or texture reference)
+       views: {"front"|"back"|"left"|"right": base64} (multiview mode; needs --multiview)
        prompt: str (text mode, or texture description)
        mesh: base64 GLB (texture mode)
        texture: bool, seed: int, steps: int, guidance_scale: float,
@@ -47,6 +48,7 @@ STATE = {
     "texture": False,
     "text_to_3d": False,
     "profile": None,
+    "multiview": False,
 }
 JOBS = {}
 JOB_QUEUE = queue.Queue()
@@ -66,6 +68,7 @@ class JobRequest(BaseModel):
     image: str | None = None
     prompt: str | None = None
     mesh: str | None = None
+    views: dict[str, str] | None = None
     texture: bool = True
     seed: int = 1234
     steps: int | None = None
@@ -117,6 +120,22 @@ def _reference_image(job, req):
     return img
 
 
+def _view_images(job, req):
+    """Decode multi-view images; cut out backgrounds where there's no transparency."""
+    views = {k: v for k, v in (req.views or {}).items() if v and k in ("front", "back", "left", "right")}
+    if not views:
+        raise ValueError("Add at least one view image.")
+    out = {}
+    for k, b64 in views.items():
+        _check_cancel(job)
+        img = _decode_image(b64)
+        if img.mode != "RGBA":
+            _set(job, phase=f"Removing background ({k})", progress=min(12, job["progress"] + 3))
+            img = W["rmbg"](img.convert("RGB"))
+        out[k] = img
+    return out
+
+
 def _shape(job, req, image):
     from hy3dgen.shapegen.pipelines import export_to_trimesh
 
@@ -129,6 +148,8 @@ def _shape(job, req, image):
         _check_cancel(job)
         _set(job, progress=int(p0 + (p1 - p0) * (step + 1) / max(1, steps)))
 
+    if STATE["multiview"] and not isinstance(image, dict):
+        image = {"front": image}
     gen = torch.Generator().manual_seed(int(req.seed))
     outputs = W["shape"](
         image=image,
@@ -168,6 +189,14 @@ def run_job(job):
         mesh = _decode_mesh(req.mesh)
         image = _reference_image(job, req)
         mesh = _texture(job, mesh, image, req.face_count, 20)
+    elif req.mode == "multiview":
+        if not STATE["multiview"]:
+            raise ValueError("This server runs a single-image model. Restart it with --multiview.")
+        views = _view_images(job, req)
+        mesh = _shape(job, req, views)
+        if req.texture:
+            ref = views.get("front") or next(iter(views.values()))
+            mesh = _texture(job, mesh, ref, req.face_count, 60)
     elif req.mode in ("image", "text"):
         if req.mode == "text":
             req.image = None
@@ -232,13 +261,17 @@ def health():
         queued = sum(1 for j in JOBS.values() if j["status"] == "queued")
     return {"ok": True, "shape_model": STATE["shape_model"], "texture": STATE["texture"],
             "text_to_3d": STATE["text_to_3d"], "profile": STATE["profile"],
+            "multiview": STATE["multiview"],
             "busy": busy, "queued": queued}
 
 
 @app.post("/jobs")
 def create_job(req: JobRequest):
-    if req.mode not in ("image", "text", "texture"):
+    if req.mode not in ("image", "text", "texture", "multiview"):
         raise HTTPException(400, f"Unknown mode '{req.mode}'.")
+    if req.mode == "multiview" and not STATE["multiview"]:
+        raise HTTPException(400, "This server runs a single-image model. "
+                                 "Restart it with: start_hunyuan.sh --multiview")
     if req.mode == "text" and not STATE["text_to_3d"]:
         raise HTTPException(400, "Text to 3D is disabled. Start the server with --enable_t23d.")
     if (req.mode == "texture" or req.texture) and not STATE["texture"]:
@@ -303,6 +336,7 @@ def load_models(args):
     if args.turbo or args.enable_flashvdm:
         W["shape"].enable_flashvdm(mc_algo=args.mc_algo)
     STATE["shape_model"] = f"{args.model_path}/{subfolder}"
+    STATE["multiview"] = "2mv" in args.model_path.lower()
     STATE["default_steps"] = 5 if args.turbo else 30
     STATE["default_guidance"] = 5.0 if args.turbo else 7.5
 
@@ -357,6 +391,8 @@ def main():
     ap.add_argument("--subfolder", default="hunyuan3d-dit-v2-mini")
     ap.add_argument("--texgen_model_path", default="tencent/Hunyuan3D-2")
     ap.add_argument("--h2", action="store_true", help="Use the full Hunyuan3D-2 shape model")
+    ap.add_argument("--multiview", "--mv", action="store_true",
+                    help="Use Hunyuan3D-2mv: build from front/back/left/right views")
     ap.add_argument("--turbo", action="store_true", help="Faster distilled shape model")
     ap.add_argument("--enable_flashvdm", action="store_true")
     ap.add_argument("--mc_algo", default="dmc")
@@ -370,6 +406,8 @@ def main():
     args = ap.parse_args()
     if args.h2:
         args.model_path, args.subfolder = "tencent/Hunyuan3D-2", "hunyuan3d-dit-v2-0"
+    if args.multiview:
+        args.model_path, args.subfolder = "tencent/Hunyuan3D-2mv", "hunyuan3d-dit-v2-mv"
 
     os.makedirs(RESULT_DIR, exist_ok=True)
     load_models(args)

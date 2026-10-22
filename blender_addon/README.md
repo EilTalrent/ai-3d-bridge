@@ -21,7 +21,8 @@ sidebar tab in Blender. Two backends:
 | Tab | What it does |
 |---|---|
 | Text | Prompt to 3D model (prompt becomes an image first, then a model) |
-| Image | PNG/JPG/WEBP to 3D model |
+| Image | PNG/JPG/WEBP to 3D model (one figure, plain background) |
+| Views | Front/back/left/right images of the same object, e.g. a character sheet cut into views. Start the server with `--multiview` |
 | Texture | AI-paints the selected mesh from a prompt or reference image. Makes new UVs and adds a textured copy |
 
 **Detail** controls shape resolution; **Texture faces** is the face count the

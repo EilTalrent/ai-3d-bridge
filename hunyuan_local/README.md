@@ -39,8 +39,20 @@ Options:
 | `start_hunyuan.sh` | Balanced: Hunyuan3D-2mini shapes, textures, text input |
 | `start_hunyuan.sh --fast` | Turbo shape model: much quicker, a bit less detail |
 | `start_hunyuan.sh --quality` | Full Hunyuan3D-2 shape model: best detail, slower |
+| `start_hunyuan.sh --multiview` | Multi-view model: build from front/back/side images (character sheets) |
 | `start_hunyuan.sh --no-text` | Skip the text-to-image model (saves ~6 GB RAM) |
 | `start_hunyuan.sh --profile 5` | Most aggressive memory saving if you run out of memory |
+
+## Getting models that match your art
+
+- **One figure per image.** Don't feed a whole character sheet: the AI will
+  try to build every pose, inset and label as one object.
+- **Plain or transparent background**, figure centered, whole body visible.
+- **Character sheets:** cut out the front, back and side views and use the
+  **Views** tab with `--multiview`. "Left"/"Right" mean which edge of the
+  picture the figure is facing.
+- Thin things (bows, bowstrings, blades held away from the body) come out
+  blobby. Generate weapons separately from their own images.
 
 ## Tips for a 10 GB card
 

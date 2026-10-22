@@ -10,7 +10,7 @@ You need your own Meshy API key: https://www.meshy.ai/settings/api
 bl_info = {
     "name": "AI 3D Bridge (Hunyuan3D local + Meshy)",
     "author": "Generated with Claude",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (3, 3, 0),
     "location": "3D Viewport > Sidebar (N) > Meshy",
     "description": "Text/Image to 3D and AI texturing offline with Hunyuan3D, or via the Meshy API",
@@ -300,6 +300,27 @@ def pipeline_image(job, api_key, p, out_dir):
     job.result_task_id = tid
 
 
+def pipeline_multi(job, api_key, p, out_dir):
+    body = {
+        "image_urls": [file_to_data_uri(v) for v in p["views"].values()],
+        "ai_model": p["ai_model"] if p["ai_model"] in ("latest", "meshy-6", "meshy-6-lite") else "latest",
+        "should_texture": p["texture"],
+        "enable_pbr": p["pbr"] and p["texture"],
+        "topology": p["topology"],
+        "target_polycount": p["polycount"],
+    }
+    if p["texture"] and p["texture_prompt"]:
+        body["texture_prompt"] = p["texture_prompt"]
+    if p["pose_mode"] != "NONE":
+        body["pose_mode"] = p["pose_mode"]
+    tid = create_task(api_key, "/v1/multi-image-to-3d", body)
+    task = _poll(job, api_key, f"/v1/multi-image-to-3d/{tid}", "Generating model", 0, 100)
+    job.phase = "Downloading"
+    job.result_path = download_file(_glb_from_task(task),
+                                    _dest(out_dir, f"meshy_views_{tid[:8]}"))
+    job.result_task_id = tid
+
+
 def _source(p):
     """input_task_id when reusing, otherwise upload the exported GLB."""
     if p.get("input_task_id"):
@@ -415,9 +436,12 @@ def pipeline_local(job, base, p, out_dir):
         body["image"] = _b64_file(p["image_path"])
     if p.get("glb_path"):
         body["mesh"] = _b64_file(p["glb_path"])
+    if p.get("views"):
+        body["views"] = {k: _b64_file(v) for k, v in p["views"].items()}
 
-    jid = local_request(base, "POST", "/jobs", body, timeout=120)["id"]
+    jid = local_request(base, "POST", "/jobs", body, timeout=300)["id"]
     job.phase = "Queued"
+    stalled_since = None
     while True:
         if job.cancel_requested:
             try:
@@ -425,7 +449,17 @@ def pipeline_local(job, base, p, out_dir):
             except MeshyError:
                 pass
             raise _Canceled()
-        st = local_request(base, "GET", f"/jobs/{jid}", timeout=10)
+        try:
+            st = local_request(base, "GET", f"/jobs/{jid}", timeout=20)
+            stalled_since = None
+        except MeshyError:
+            # The server can stall briefly while it shuffles models between
+            # RAM and GPU; only give up after two minutes of silence.
+            stalled_since = stalled_since or time.time()
+            if time.time() - stalled_since > 120:
+                raise
+            time.sleep(3.0)
+            continue
         job.phase = st.get("phase") or job.phase
         job.progress = int(st.get("progress") or 0)
         job.queue_pos = int(st.get("queue_position") or 0)
@@ -436,7 +470,9 @@ def pipeline_local(job, base, p, out_dir):
         time.sleep(1.0)
 
     job.phase = "Downloading"
-    stem = p.get("prompt") or os.path.splitext(os.path.basename(p.get("image_path") or "model"))[0]
+    first_view = next(iter((p.get("views") or {}).values()), None)
+    stem = p.get("prompt") or os.path.splitext(
+        os.path.basename(p.get("image_path") or first_view or "model"))[0]
     dest = _dest(out_dir, f"hunyuan_{stem[:40]}_{jid[:6]}")
     req = urllib.request.Request(base.rstrip("/") + f"/jobs/{jid}/result",
                                  headers={"User-Agent": USER_AGENT})
@@ -452,6 +488,7 @@ PIPELINES = {
     "local": pipeline_local,
     "text": pipeline_text,
     "image": pipeline_image,
+    "multi": pipeline_multi,
     "retexture": pipeline_retexture,
     "remesh": pipeline_remesh,
     "rig": pipeline_rig,
@@ -676,6 +713,8 @@ class MESHY_Props(bpy.types.PropertyGroup):
         items=[
             ("TEXT", "Text", "Text to 3D", "FONT_DATA", 0),
             ("IMAGE", "Image", "Image to 3D", "IMAGE_DATA", 1),
+            ("MULTI", "Views", "Build from several views of the same object "
+                               "(front, back, sides) - best for character sheets", "IMAGE_REFERENCE", 5),
             ("TEXTURE", "Texture", "AI-texture the selected model", "TEXTURE", 2),
             ("REMESH", "Remesh", "Retopologize the selected model", "MOD_REMESH", 3),
             ("RIG", "Rig", "Auto-rig and animate the selected character", "ARMATURE_DATA", 4),
@@ -687,6 +726,14 @@ class MESHY_Props(bpy.types.PropertyGroup):
     negative_prompt: StringProperty(name="Avoid", description="What to avoid", maxlen=800)
     image_path: StringProperty(name="Image", subtype="FILE_PATH",
                                description="PNG, JPG or WEBP of the object")
+    mv_front: StringProperty(name="Front", subtype="FILE_PATH",
+                             description="Object seen from the front")
+    mv_back: StringProperty(name="Back", subtype="FILE_PATH",
+                            description="Object seen from behind")
+    mv_left: StringProperty(name="Left", subtype="FILE_PATH",
+                            description="Side view with the object facing the LEFT edge of the picture")
+    mv_right: StringProperty(name="Right", subtype="FILE_PATH",
+                             description="Side view with the object facing the RIGHT edge of the picture")
     ai_model: EnumProperty(name="Model", items=MODEL_ITEMS, default="latest")
     topology: EnumProperty(name="Topology",
                            items=[("triangle", "Triangles", ""), ("quad", "Quads", "")],
@@ -780,6 +827,23 @@ def _selected_source(op, context, props, kind, allow_reuse=True):
     return {"glb_path": path, "glb_is_temp": True}
 
 
+def _collect_views(op, p):
+    views = {}
+    for key in ("front", "back", "left", "right"):
+        raw = getattr(p, f"mv_{key}")
+        if not raw:
+            continue
+        path = bpy.path.abspath(raw)
+        if not os.path.isfile(path):
+            op.report({"ERROR"}, f"{key.title()} image not found.")
+            return None
+        views[key] = path
+    if not views:
+        op.report({"ERROR"}, "Pick at least one view image (front is the most important).")
+        return None
+    return views
+
+
 class MESHY_OT_generate(bpy.types.Operator):
     bl_idname = "meshy.generate"
     bl_label = "Generate"
@@ -814,6 +878,13 @@ class MESHY_OT_generate(bpy.types.Operator):
             params = dict(common, image_path=path)
             start_job(os.path.splitext(os.path.basename(path))[0], "image", key, params,
                       _out_dir(context))
+
+        elif p.mode == "MULTI":
+            views = _collect_views(self, p)
+            if views is None:
+                return {"CANCELLED"}
+            label = os.path.splitext(os.path.basename(next(iter(views.values()))))[0]
+            start_job(label, "multi", key, dict(common, views=views), _out_dir(context))
 
         elif p.mode == "TEXTURE":
             style = bpy.path.abspath(p.style_image) if p.style_image else ""
@@ -868,6 +939,12 @@ class MESHY_OT_generate(bpy.types.Operator):
                 return {"CANCELLED"}
             params.update(mode="image", image_path=path)
             label = os.path.splitext(os.path.basename(path))[0]
+        elif p.mode == "MULTI":
+            views = _collect_views(self, p)
+            if views is None:
+                return {"CANCELLED"}
+            params.update(mode="multiview", views=views)
+            label = os.path.splitext(os.path.basename(next(iter(views.values()))))[0]
         elif p.mode == "TEXTURE":
             style = bpy.path.abspath(p.style_image) if p.style_image else ""
             if style and not os.path.isfile(style):
@@ -1036,11 +1113,11 @@ class MESHY_PT_main(bpy.types.Panel):
         row.operator("preferences.addon_show", text="", icon="PREFERENCES").module = ADDON_ID
 
         row = layout.row(align=True)
-        for m in ("TEXT", "IMAGE", "TEXTURE"):
+        for m in ("TEXT", "IMAGE", "MULTI", "TEXTURE"):
             row.prop_enum(p, "mode", m)
         col = layout.column()
 
-        if p.mode not in ("TEXT", "IMAGE", "TEXTURE"):
+        if p.mode not in ("TEXT", "IMAGE", "MULTI", "TEXTURE"):
             col.label(text="Remesh / Rig need the Meshy cloud backend.", icon="INFO")
             col.label(text="Blender's Remesh modifier works offline.")
             return
@@ -1065,6 +1142,19 @@ class MESHY_PT_main(bpy.types.Panel):
             col.prop(p, "seed")
             col.operator("meshy.generate", text="Generate from Image", icon="PLAY")
 
+        elif p.mode == "MULTI":
+            if SERVER_INFO.get("ok") and not SERVER_INFO.get("multiview"):
+                warn = col.box()
+                warn.label(text="Server is in single-image mode", icon="ERROR")
+                warn.label(text="Restart it with:  start_hunyuan.sh --multiview")
+            self._views(col, p)
+            col.prop(p, "texture")
+            col.prop(p, "local_detail")
+            if p.texture:
+                col.prop(p, "local_faces")
+            col.prop(p, "seed")
+            col.operator("meshy.generate", text="Generate from Views", icon="PLAY")
+
         elif p.mode == "TEXTURE":
             obj = context.active_object
             hint = col.box()
@@ -1078,6 +1168,13 @@ class MESHY_PT_main(bpy.types.Panel):
             col.prop(p, "local_faces")
             col.prop(p, "seed")
             col.operator("meshy.generate", text="Texture Selected", icon="BRUSH_DATA")
+
+    def _views(self, col, p):
+        box = col.box()
+        box.label(text="One figure per image, plain background", icon="INFO")
+        for key in ("front", "back", "left", "right"):
+            box.prop(p, f"mv_{key}")
+        box.label(text="Left/Right = which edge the figure faces")
 
     def _draw_meshy(self, context):
         layout = self.layout
@@ -1111,6 +1208,15 @@ class MESHY_PT_main(bpy.types.Panel):
                 col.prop(p, "pbr")
             self._advanced(col, p)
             col.operator("meshy.generate", text="Generate from Image", icon="PLAY")
+
+        elif p.mode == "MULTI":
+            self._views(col, p)
+            col.prop(p, "texture")
+            if p.texture:
+                col.prop(p, "texture_prompt", text="Texture")
+                col.prop(p, "pbr")
+            self._advanced(col, p)
+            col.operator("meshy.generate", text="Generate from Views", icon="PLAY")
 
         elif p.mode == "TEXTURE":
             self._selection_hint(col, context, p)

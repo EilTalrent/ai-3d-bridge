@@ -5,6 +5,7 @@
 #   bash ~/hunyuan3d/start_hunyuan.sh            # balanced (default)
 #   bash ~/hunyuan3d/start_hunyuan.sh --fast     # turbo shape model, quicker
 #   bash ~/hunyuan3d/start_hunyuan.sh --quality  # full-size shape model, slower
+#   bash ~/hunyuan3d/start_hunyuan.sh --multiview  # build from several views (front/back/side)
 #   bash ~/hunyuan3d/start_hunyuan.sh --no-text  # skip text model, saves RAM
 # Any other options are passed to hunyuan_server.py (see --help there).
 
@@ -17,6 +18,7 @@ for a in "$@"; do
     case "$a" in
         --fast)    ARGS+=(--turbo) ;;
         --quality) ARGS+=(--h2) ;;
+        --multiview|--mv) ARGS+=(--multiview) ;;
         --no-text) TEXT=0 ;;
         *)         ARGS+=("$a") ;;
     esac
