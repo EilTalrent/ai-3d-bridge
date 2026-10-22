@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.zip
+meshy_models/
+server_results/
+gradio_cache/
+dist/
