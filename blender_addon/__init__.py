@@ -10,7 +10,7 @@ You need your own Meshy API key: https://www.meshy.ai/settings/api
 bl_info = {
     "name": "AI 3D Bridge (Hunyuan3D local + Meshy)",
     "author": "Generated with Claude",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (3, 3, 0),
     "location": "3D Viewport > Sidebar (N) > Meshy",
     "description": "Text/Image to 3D and AI texturing offline with Hunyuan3D, or via the Meshy API",
@@ -770,6 +770,17 @@ class MESHY_Props(bpy.types.PropertyGroup):
                ("256", "Standard", "Good balance"),
                ("384", "High", "Sharper detail, slower, more memory")],
         default="256")
+    retopo_faces: IntProperty(
+        name="Target faces", default=15000, min=1000, max=100000, soft_max=40000,
+        description="Triangle count after decimation. QRemeshify is happiest under ~20k")
+    retopo_min_island: FloatProperty(
+        name="Remove bits under", default=0.5, min=0.0, max=20.0, subtype="PERCENTAGE",
+        description="Delete separate pieces smaller than this share of the whole mesh "
+                    "(AI floaters). 0 keeps everything")
+    retopo_fill_holes: BoolProperty(name="Fill holes", default=True)
+    retopo_center: BoolProperty(
+        name="Center for symmetry", default=True,
+        description="Put the object origin at the middle of the mesh so symmetry options line up")
     local_faces: IntProperty(
         name="Texture faces", default=40000, min=5000, max=150000, soft_max=80000,
         description="Mesh is reduced to this many faces before texturing. "
@@ -1082,6 +1093,205 @@ class MESHY_OT_reveal(bpy.types.Operator):
 # UI
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Retopology prep: clean an AI mesh so QRemeshify / QuadriFlow don't choke
+# ---------------------------------------------------------------------------
+
+def _islands(bm):
+    """Connected groups of faces (lists of BMFace)."""
+    seen, groups = set(), []
+    for f in bm.faces:
+        if f.index in seen:
+            continue
+        stack, group = [f], []
+        seen.add(f.index)
+        while stack:
+            cur = stack.pop()
+            group.append(cur)
+            for e in cur.edges:
+                for nb in e.link_faces:
+                    if nb.index not in seen:
+                        seen.add(nb.index)
+                        stack.append(nb)
+        groups.append(group)
+    return groups
+
+
+def _clean_mesh(me, props):
+    """Bmesh cleanup on a mesh datablock. Returns a dict of what happened."""
+    import bmesh
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    info = {"faces_before": len(bm.faces)}
+
+    size = max((v.co.length for v in bm.verts), default=1.0) or 1.0
+    eps = size * 1e-5
+
+    bmesh.ops.remove_doubles(bm, verts=list(bm.verts), dist=eps)
+    bmesh.ops.dissolve_degenerate(bm, edges=list(bm.edges), dist=eps)
+
+    loose_e = [e for e in bm.edges if not e.link_faces]
+    if loose_e:
+        bmesh.ops.delete(bm, geom=loose_e, context="EDGES")
+    loose_v = [v for v in bm.verts if not v.link_faces]
+    if loose_v:
+        bmesh.ops.delete(bm, geom=loose_v, context="VERTS")
+
+    removed = 0
+    if props.retopo_min_island > 0 and bm.faces:
+        bm.faces.ensure_lookup_table()
+        bm.faces.index_update()
+        groups = _islands(bm)
+        total = len(bm.faces)
+        biggest = max(len(g) for g in groups)
+        small = [g for g in groups
+                 if len(g) < total * props.retopo_min_island / 100.0 and len(g) != biggest]
+        doomed = [f for g in small for f in g]
+        if doomed:
+            bmesh.ops.delete(bm, geom=doomed, context="FACES")
+            removed = len(small)
+        loose_v = [v for v in bm.verts if not v.link_faces]
+        if loose_v:
+            bmesh.ops.delete(bm, geom=loose_v, context="VERTS")
+    info["islands_removed"] = removed
+
+    filled = 0
+    if props.retopo_fill_holes:
+        boundary = [e for e in bm.edges if e.is_boundary]
+        if boundary:
+            res = bmesh.ops.holes_fill(bm, edges=boundary, sides=0)
+            new_faces = res.get("faces", [])
+            filled = len(new_faces)
+            if new_faces:
+                bmesh.ops.triangulate(bm, faces=new_faces)
+    info["holes_filled"] = filled
+
+    for e in bm.edges:  # sharp marks would be treated as hard constraints
+        e.smooth = True
+    for f in bm.faces:
+        f.smooth = True
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+    bm.to_mesh(me)
+    bm.free()
+    me.update()
+    return info
+
+
+def _clear_custom_normals(obj):
+    try:
+        with bpy.context.temp_override(object=obj, active_object=obj,
+                                       selected_objects=[obj], selected_editable_objects=[obj]):
+            bpy.ops.mesh.customdata_custom_splitnormals_clear()
+    except Exception:
+        pass  # older Blender / no custom normals
+
+
+def _apply_decimate(context, obj, target):
+    faces = len(obj.data.polygons)
+    if faces <= target:
+        return faces
+    mod = obj.modifiers.new("RetopoPrepDecimate", "DECIMATE")
+    mod.decimate_type = "COLLAPSE"
+    mod.ratio = max(0.001, target / faces)
+    mod.use_collapse_triangulate = True
+    dg = context.evaluated_depsgraph_get()
+    ev = obj.evaluated_get(dg)
+    new_me = bpy.data.meshes.new_from_object(ev, preserve_all_data_layers=True, depsgraph=dg)
+    obj.modifiers.remove(mod)
+    old = obj.data
+    new_me.name = old.name
+    obj.data = new_me
+    if old.users == 0:
+        bpy.data.meshes.remove(old)
+    return len(new_me.polygons)
+
+
+class MESHY_OT_retopo_prep(bpy.types.Operator):
+    bl_idname = "meshy.retopo_prep"
+    bl_label = "Prep for Retopo"
+    bl_description = ("Make a cleaned, decimated copy of the active mesh that QRemeshify / "
+                      "QuadriFlow can handle. The original is kept and hidden")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        o = context.active_object
+        return o is not None and o.type == "MESH" and context.mode == "OBJECT"
+
+    def execute(self, context):
+        from mathutils import Matrix, Vector
+        props = context.scene.meshy
+        src = context.active_object
+        if len(src.data.polygons) == 0:
+            self.report({"ERROR"}, "This mesh has no faces.")
+            return {"CANCELLED"}
+
+        # copy, so the original (with its texture) stays untouched
+        obj = src.copy()
+        obj.data = src.data.copy()
+        obj.name = f"{src.name}_retopo_ready"
+        for col in src.users_collection:
+            col.objects.link(obj)
+        obj.modifiers.clear()
+        obj.parent = None
+        for key in (PROP_TASK_ID, PROP_TASK_KIND, PROP_RIG_ID):  # it's a new mesh now
+            if key in obj.keys():
+                del obj[key]
+        obj.data.transform(src.matrix_world)       # apply all transforms
+        obj.matrix_world = Matrix.Identity(4)
+
+        info = _clean_mesh(obj.data, props)
+        _clear_custom_normals(obj)
+        final = _apply_decimate(context, obj, props.retopo_faces)
+
+        if props.retopo_center and obj.data.vertices:
+            xs = [v.co for v in obj.data.vertices]
+            lo = Vector((min(c.x for c in xs), min(c.y for c in xs), min(c.z for c in xs)))
+            hi = Vector((max(c.x for c in xs), max(c.y for c in xs), max(c.z for c in xs)))
+            mid = (lo + hi) / 2
+            obj.data.transform(Matrix.Translation(-mid))
+            obj.location = mid
+
+        src.hide_set(True)
+        for o in context.view_layer.objects:
+            o.select_set(False)
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+
+        bits = [f"{info['faces_before']:,} -> {final:,} faces"]
+        if info["islands_removed"]:
+            bits.append(f"{info['islands_removed']} floating bits removed")
+        if info["holes_filled"]:
+            bits.append(f"{info['holes_filled']} hole faces filled")
+        self.report({"INFO"}, "Ready for retopo: " + ", ".join(bits) + ". Save before remeshing!")
+        return {"FINISHED"}
+
+
+class MESHY_PT_retopo(bpy.types.Panel):
+    bl_label = "Retopo Prep"
+    bl_idname = "MESHY_PT_retopo"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "AI 3D"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        p = context.scene.meshy
+        col = self.layout.column()
+        obj = context.active_object
+        if obj is not None and obj.type == "MESH":
+            col.label(text=f"{obj.name}: {len(obj.data.polygons):,} faces", icon="MESH_DATA")
+        else:
+            col.label(text="Select a mesh", icon="INFO")
+        col.prop(p, "retopo_faces")
+        col.prop(p, "retopo_min_island")
+        col.prop(p, "retopo_fill_holes")
+        col.prop(p, "retopo_center")
+        col.operator("meshy.retopo_prep", icon="MOD_DECIM")
+        col.label(text="Then run QRemeshify on the copy.")
+
+
 class MESHY_PT_main(bpy.types.Panel):
     bl_label = "AI 3D Generator"
     bl_idname = "MESHY_PT_main"
@@ -1335,7 +1545,9 @@ CLASSES = (
     MESHY_OT_balance,
     MESHY_OT_open_url,
     MESHY_OT_reveal,
+    MESHY_OT_retopo_prep,
     MESHY_PT_main,
+    MESHY_PT_retopo,
 )
 
 

@@ -25,6 +25,10 @@ sidebar tab in Blender. Two backends:
 | Views | Front/back/left/right images of the same object, e.g. a character sheet cut into views. Start the server with `--multiview` |
 | Texture | AI-paints the selected mesh from a prompt or reference image. Makes new UVs and adds a textured copy |
 
+**Retopo Prep** (second panel in the tab): makes a cleaned, decimated copy
+of the selected mesh (floaters removed, holes filled, normals fixed, centered)
+so QRemeshify or QuadriFlow won't crash on it. The original is kept, hidden.
+
 **Detail** controls shape resolution; **Texture faces** is the face count the
 mesh is reduced to before texturing (lower = faster, less GPU memory). Use the
 refresh button at the top of the tab to check the server is running.

@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "meshy_bridge"
-version = "1.2.0"
+version = "1.3.0"
 name = "AI 3D Bridge"
 tagline = "AI text or image to 3D, offline with Hunyuan3D or via Meshy"
 maintainer = "Meshy Bridge <noreply@example.com>"
